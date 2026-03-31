@@ -1,8 +1,10 @@
-spacy>=3.7.0
+spacy==3.7.2
+thinc==8.2.2
+blis==0.7.11
+numpy==1.26.4
 en-core-web-md @ https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.7.1/en_core_web_md-3.7.1-py3-none-any.whl
 sentence-transformers>=2.6.0
 scikit-learn>=1.4.0
-numpy>=1.26.0
 rapidfuzz>=3.6.0
 rank-bm25>=0.2.2
 fastapi>=0.110.0
