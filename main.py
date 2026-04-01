@@ -23,6 +23,7 @@ import gc
 import json
 import os
 import time
+import sys
 import traceback
 import warnings
 from contextlib import asynccontextmanager
@@ -45,7 +46,7 @@ from model_loader import get_nlp, get_sbert, memory_usage_mb
 # Nlp_pipeline imports the functions — it must NOT call get_nlp/get_sbert
 # at module level either. If it does, patch it to call get_nlp() lazily.
 from Nlp_pipeline import analyze_resume
-
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # ── Gemini client ──────────────────────────────────────────────────────────────
 # FIX: Use google-genai (new unified SDK, import as google.genai).
