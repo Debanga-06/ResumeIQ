@@ -14,8 +14,6 @@ rank-bm25>=0.2.2
 rapidfuzz>=3.6.0
 
 # ── Gemini (new unified SDK) ──────────────────────────────────────────────────
-# Imports as: from google import genai
-# DO NOT add google-generativeai — it conflicts with this package.
 google-genai>=0.7.0
 
 # ── Async HTTP (used for fallback if needed) ───────────────────────────────────
