@@ -1,3 +1,5 @@
+--prefer-binary
+
 spacy==3.7.2
 thinc==8.2.2
 blis==0.7.11
