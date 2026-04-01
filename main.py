@@ -26,8 +26,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
-
-from ResumeIQ.Nlp_pipeline import analyze_resume
+from Nlp_pipeline import analyze_resume
 
 # ── Suppress noisy warnings ────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", message=".*position_ids.*")
