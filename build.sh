@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# build.sh — Render build script
-# Render runs this ONCE during deployment, not on every start.
-# Changes here require a manual redeploy.
 set -e   # exit immediately on any error
 
 echo "════════════════════════════════════════"
@@ -9,10 +6,6 @@ echo " ResumeIQ — Render Build Script"
 echo "════════════════════════════════════════"
 
 # ── Step 1: CPU-only PyTorch ────────────────────────────────────────────────
-# Installing CPU-only PyTorch saves ~800MB vs the default CUDA package.
-# This is the single most important memory optimisation for free-tier deploys.
-# Must happen BEFORE pip install -r requirements.txt so sentence-transformers
-# picks up the CPU wheel instead of pulling CUDA as a dependency.
 echo ""
 echo "==> [1/5] Installing CPU-only PyTorch..."
 pip install torch --index-url https://download.pytorch.org/whl/cpu --quiet
@@ -25,18 +18,12 @@ pip install -r requirements.txt --quiet
 echo "    Dependencies installed."
 
 # ── Step 3: spaCy model ─────────────────────────────────────────────────────
-# Downloads en_core_web_md (~50MB) to the Python packages directory.
-# This is cached by Render between deploys as long as requirements.txt
-# hasn't changed.
 echo ""
 echo "==> [3/5] Downloading spaCy en_core_web_md..."
 python -m spacy download en_core_web_md
 echo "    spaCy model ready."
 
 # ── Step 4: Pre-cache SBERT model ───────────────────────────────────────────
-# Downloads all-MiniLM-L6-v2 to $SENTENCE_TRANSFORMERS_HOME (/tmp/sbert_cache).
-# Without this, the first request would trigger a download mid-flight,
-# causing a timeout or crash.
 echo ""
 echo "==> [4/5] Pre-caching SBERT all-MiniLM-L6-v2..."
 SENTENCE_TRANSFORMERS_HOME=/tmp/sbert_cache python -c "
