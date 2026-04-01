@@ -34,7 +34,7 @@ Built as both a functional product and a portfolio-grade demonstration of applie
 | **Skill Gap Analysis** | Matched, missing, and partial skills with fuzzy matching |
 | **spaCy NER** | Extracts organizations, technologies, dates, and locations |
 | **TF-IDF Interpretability** | Shows which terms drove the score |
-| **AI Coaching** | Claude generates 3 targeted resume improvement suggestions |
+| **AI Coaching** | Gemini generates 3 targeted resume improvement suggestions |
 | **Batch Screening** | Upload 20 resumes at once, ranked by score, exportable to CSV |
 | **PDF & Image Upload** | PDF.js for text PDFs, Claude Vision OCR for scanned images |
 | **Saved Sessions** | localStorage-based history — compare analyses over time |
@@ -61,7 +61,7 @@ Built as both a functional product and a portfolio-grade demonstration of applie
 |---|---|
 | **Vanilla HTML/CSS/JS** | Zero-dependency frontend, no build step required |
 | **PDF.js** | Client-side PDF text extraction |
-| **Claude Vision API** | OCR for scanned resumes and images |
+| **Gemini Vision API** | OCR for scanned resumes and images |
 | **localStorage** | Persistent session storage |
 
 ---
@@ -398,6 +398,6 @@ See the LICENSE file for details.
 
 <div align="center">
 
-Built with Python · spaCy · Sentence-Transformers · FastAPI · Claude API
+Built with Python · spaCy · Sentence-Transformers · FastAPI · Gemini API
 
 </div>
