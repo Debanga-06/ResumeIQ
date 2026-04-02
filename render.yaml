@@ -1,33 +1,24 @@
 # render.yaml — Render Blueprint
+# Lets you configure your service from code instead of clicking the dashboard.
+# Commit this file to GitHub and Render reads it automatically.
+#
 # Docs: https://render.com/docs/blueprint-spec
 
 services:
   - type: web
     name: resumeiq-api
     runtime: python
-    region: oregon          # options: oregon, frankfurt, singapore, ohio, virginia
-
-    plan: free
-
-    buildCommand: bash build.sh
-
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
-
-    # Render checks this path after deploy. Must return HTTP 200.
+    region: oregon          # change to: frankfurt, singapore, ohio, virginia
+    plan: starter           # free | starter ($7/mo) — use starter for ML models
+    buildCommand: ./build.sh
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
 
     envVars:
-      # Suppress HuggingFace tokenizer fork warning
+      # Silence tokenizer warning from HuggingFace
       - key: TOKENIZERS_PARALLELISM
         value: "false"
-
-      # Cache SBERT model here — /tmp is writable on Render
+      # Tell sentence-transformers where to cache models (Render's writable dir)
       - key: SENTENCE_TRANSFORMERS_HOME
         value: /tmp/sbert_cache
-
-      # Limit PyTorch to 1 thread (prevents OOM from thread-stack overhead
-      # on single-core free-tier containers)
-      - key: OMP_NUM_THREADS
-        value: "1"
-      - key: MKL_NUM_THREADS
-        value: "1"
+  
