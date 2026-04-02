@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![spaCy](https://img.shields.io/badge/spaCy-3.7+-09A3D5?style=flat-square&logo=spacy&logoColor=white)
-![License](https://img.shields.io/badge/License-GPL-3.0-e8b84b?style=flat-square)
+![License](https://img.shields.io/badge/License-GPL--3.0-e8b84b?style=flat-square)
 ![Version](https://img.shields.io/badge/Version-2.0.0-success?style=flat-square)
 
 **A real NLP/ML resume screening pipeline — no LLM shortcuts, actual models.**
