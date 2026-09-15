@@ -52,7 +52,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://resumeiq-1-c8ry.onrender.com"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
