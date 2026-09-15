@@ -2,10 +2,10 @@
 Nlp_pipeline.py — Real ML/NLP Resume Screening Pipeline
 
 Models & algorithms used:
-  - spaCy (en_core_web_md)         → NER, POS tagging, lemmatization
+  - spaCy (en_core_web_sm)         → NER, POS tagging, lemmatization, noun chunks
   - scikit-learn TfidfVectorizer   → TF-IDF document vectors
   - sentence-transformers (SBERT)  → Dense semantic embeddings
-  - rank_bm25 (BM25Okapi)          → Probabilistic term weighting (NEW)
+  - rank_bm25 (BM25Okapi)          → Probabilistic term weighting
   - rapidfuzz                      → Fuzzy skill matching
   - sklearn cosine_similarity      → Vector distance
 
@@ -23,22 +23,63 @@ WHY ATS score separately?
   matching — no semantics, no fuzzy. A candidate with 90% SBERT semantic similarity
   can fail ATS if they write "built APIs" instead of "REST API development".
   The ATS score tells candidates: "fix THIS specific wording to pass the filter."
+
+PERFORMANCE NOTES (read this if /analyze is slow or 502s on Render)
+  This file previously called `get_nlp()(text)` up to 7 times per request
+  (preprocessing, skill extraction, ATS keywords, NER — twice each for
+  resume + JD), with NO upper bound on input length. On a long resume/JD,
+  that meant several full spaCy pipeline runs over uncapped text, plus a
+  skill-fuzzy-match loop that rebuilt its candidate list from scratch for
+  every one of ~100 taxonomy skills. On Render's shared CPU this can easily
+  take longer than the platform's upstream timeout, and because the FastAPI
+  route that calls this module is `async def` but was calling this fully
+  synchronous, CPU-bound pipeline directly (not via a thread), it also
+  blocked the whole event loop for the duration — see main.py's /analyze
+  handler for the corresponding fix (asyncio.to_thread).
+
+  Fixes in this version:
+    1. MAX_INPUT_CHARS caps every input once, up front, before anything
+       else runs — every downstream stage inherits the cap.
+    2. Exactly ONE spaCy Doc is created per document (resume, JD) and
+       reused for preprocessing, skill NER, ATS keyword extraction, and
+       full NER extraction — down from up to 4 parses per document.
+    3. extract_skills() builds its fuzzy-match candidate list (words +
+       bigrams) ONCE per document instead of once per taxonomy skill —
+       this was the single biggest CPU cost on longer resumes.
+    4. SBERT inference runs inside torch.inference_mode() to avoid
+       retaining any autograd state.
+    5. Stage-by-stage logging so Render logs show exactly where time is
+       spent (or where a failure happens) instead of a bare 502/500.
 """
 
 import re
-import json
+import time
+import logging
 import spacy
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import fuzz, process
-
-# BM25 — NEW
 from rank_bm25 import BM25Okapi
 
-# ─── Lazy model loading ──────────────────────────────────────────────────────
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - torch ships transitively via sentence-transformers
+    _TORCH_AVAILABLE = False
+
+logger = logging.getLogger("resumeiq.pipeline")
+
+# ─── Perf / safety limits ─────────────────────────────────────────────────────
+# Resumes and JDs are a few hundred to a couple thousand words in practice.
+# Capping at ~6000 chars (roughly 1000-1200 words) is generous for real
+# documents but bounds spaCy parse time, fuzzy-match candidate count, and
+# memory for pathological inputs (e.g. a badly-parsed PDF dumping 50k chars).
+MAX_INPUT_CHARS = 6000
+
+# ─── Lazy model loading ────────────────────────────────────────────────────────
 # Models are NOT loaded when FastAPI imports this module.
 # This keeps /health lightweight and prevents Render startup OOM.
 
@@ -48,26 +89,24 @@ sbert = None
 
 def get_nlp():
     global nlp
-
     if nlp is None:
-        print("Loading spaCy model...")
+        logger.info("Loading spaCy model (en_core_web_sm)...")
+        t0 = time.time()
         nlp = spacy.load("en_core_web_sm")
-        print("spaCy model loaded.")
-
+        logger.info("spaCy model loaded in %.2fs", time.time() - t0)
     return nlp
 
 
 def get_sbert():
     global sbert
-
     if sbert is None:
-        print("Loading SBERT model...")
+        logger.info("Loading SBERT model (all-MiniLM-L6-v2)...")
+        t0 = time.time()
         sbert = SentenceTransformer(
             "all-MiniLM-L6-v2",
             device="cpu"
         )
-        print("SBERT model loaded.")
-
+        logger.info("SBERT model loaded in %.2fs", time.time() - t0)
     return sbert
 
 
@@ -118,17 +157,39 @@ SECTION_PATTERNS = {
 }
 
 
-# ─── 1. TEXT PREPROCESSING ───────────────────────────────────────────────────
-def preprocess_text(text: str) -> str:
-    """
-    Tokenize → lowercase → lemmatize → remove stopwords/punctuation.
-    Returns clean string suitable for TF-IDF and BM25.
-    """
+# ─── 0. INPUT SAFETY ──────────────────────────────────────────────────────────
+def truncate_text(text: str, label: str) -> str:
+    """Cap input length once, up front. Every downstream stage (spaCy,
+    fuzzy skill matching, BM25, SBERT) inherits this cap, which is what
+    keeps a single oversized request from ballooning into multi-second
+    processing time / memory spikes on Render."""
+    if len(text) > MAX_INPUT_CHARS:
+        logger.warning(
+            "%s truncated from %d to %d chars", label, len(text), MAX_INPUT_CHARS
+        )
+        return text[:MAX_INPUT_CHARS]
+    return text
+
+
+def clean_text(text: str) -> str:
+    """Strip URLs, emails, and phone numbers; collapse whitespace.
+    Run ONCE per document, before the single spaCy parse, so junk tokens
+    never enter spaCy's NER, TF-IDF, or BM25 vocab downstream."""
     text = re.sub(r"http\S+|www\.\S+", " ", text)
     text = re.sub(r"\S+@\S+", " ", text)
     text = re.sub(r"\+?\d[\d\s\-\(\)]{8,}\d", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    doc = get_nlp()(text)
+    return text
+
+
+# ─── 1. TEXT PREPROCESSING ────────────────────────────────────────────────────
+def preprocess_text(doc) -> str:
+    """
+    Lemmatize → remove stopwords/punctuation from an ALREADY-PARSED spaCy Doc.
+    Returns clean string suitable for TF-IDF and BM25.
+    (No longer calls spaCy itself — the Doc is parsed once in analyze_resume()
+    and reused across every stage that needs it.)
+    """
     tokens = [
         token.lemma_.lower() for token in doc
         if not token.is_stop and not token.is_punct
@@ -148,7 +209,7 @@ def tokenize_for_bm25(text: str) -> List[str]:
     return [t for t in tokens if len(t) > 1]
 
 
-# ─── 2. SECTION SEGMENTATION ─────────────────────────────────────────────────
+# ─── 2. SECTION SEGMENTATION ──────────────────────────────────────────────────
 def parse_sections(text: str) -> Dict[str, str]:
     lines = text.split("\n")
     sections: Dict[str, List[str]] = {"header": []}
@@ -168,35 +229,54 @@ def parse_sections(text: str) -> Dict[str, str]:
     return {k: "\n".join(v).strip() for k, v in sections.items() if v}
 
 
-# ─── 3. SKILL EXTRACTION ─────────────────────────────────────────────────────
-def extract_skills(text: str, threshold: int = 85) -> Dict[str, List[str]]:
+# ─── 3. SKILL EXTRACTION ──────────────────────────────────────────────────────
+def _build_ngrams(text_lower: str) -> List[str]:
+    """Word + bigram candidate list for fuzzy matching, built ONCE per
+    document. Previously this was rebuilt from scratch inside the loop for
+    every one of ~100 taxonomy skills — O(skills × words) redone work that
+    was the single biggest CPU cost in the pipeline on longer resumes."""
+    words = re.findall(r"[\w\.\+\#]+", text_lower)
+    bigrams = [" ".join(words[i:i + 2]) for i in range(len(words) - 1)]
+    return list(dict.fromkeys(words + bigrams))  # dedupe, preserve order
+
+
+def extract_skills(text_lower: str, doc, threshold: int = 85) -> Dict[str, List[str]]:
     """
     Two-strategy extraction:
     A) Fuzzy match against skill taxonomy (handles "Postgres" → "postgresql")
     B) spaCy NER for PRODUCT/ORG entities (catches things taxonomy misses)
+
+    `text_lower` and `doc` should both come from the same already-cleaned,
+    already-truncated document text (see analyze_resume()).
     """
-    text_lower = text.lower()
     found: Dict[str, List[str]] = {cat: [] for cat in SKILL_TAXONOMY}
+    ngrams = None  # built lazily — only if we actually need a fuzzy fallback
 
     for category, skills in SKILL_TAXONOMY.items():
         for skill in skills:
             if skill in text_lower:
                 found[category].append(skill)
-            else:
-                words = re.findall(r"[\w\.\+\#]+", text_lower)
-                ngrams = words + [" ".join(words[i:i+2]) for i in range(len(words)-1)]
-                match = process.extractOne(skill, ngrams, scorer=fuzz.ratio)
-                if match and match[1] >= threshold:
-                    found[category].append(skill)
+                continue
+            if ngrams is None:
+                ngrams = _build_ngrams(text_lower)
+            # score_cutoff lets rapidfuzz's C implementation bail out early
+            # on poor candidates instead of scoring every ngram fully.
+            match = process.extractOne(
+                skill, ngrams, scorer=fuzz.ratio, score_cutoff=threshold
+            )
+            if match:
+                found[category].append(skill)
 
-    doc = get_nlp()(text[:5000])
-    ner_skills = [ent.text.lower() for ent in doc.ents if ent.label_ in ("PRODUCT", "ORG", "WORK_OF_ART")]
+    ner_skills = [
+        ent.text.lower() for ent in doc.ents
+        if ent.label_ in ("PRODUCT", "ORG", "WORK_OF_ART")
+    ]
     found["ner_extracted"] = list(set(ner_skills))
     found["all"] = sorted(set(s for cat, skills in found.items() if cat != "all" for s in skills))
     return found
 
 
-# ─── 4. TF-IDF SIMILARITY ────────────────────────────────────────────────────
+# ─── 4. TF-IDF SIMILARITY ─────────────────────────────────────────────────────
 def tfidf_similarity(resume_clean: str, jd_clean: str) -> float:
     """
     Cosine similarity on TF-IDF vectors.
@@ -208,6 +288,7 @@ def tfidf_similarity(resume_clean: str, jd_clean: str) -> float:
         matrix = vectorizer.fit_transform([resume_clean, jd_clean])
         return float(round(cosine_similarity(matrix[0:1], matrix[1:2])[0][0], 4))
     except Exception:
+        logger.exception("tfidf_similarity failed, returning 0.0")
         return 0.0
 
 
@@ -224,10 +305,11 @@ def get_tfidf_top_terms(resume_clean: str, jd_clean: str, top_n: int = 15) -> Di
             "overlap_terms":    list(set(resume_top) & set(jd_top)),
         }
     except Exception:
+        logger.exception("get_tfidf_top_terms failed, returning {}")
         return {}
 
 
-# ─── 5. BM25 SIMILARITY (NEW) ─────────────────────────────────────────────────
+# ─── 5. BM25 SIMILARITY ───────────────────────────────────────────────────────
 def bm25_similarity(resume_tokens: List[str], jd_tokens: List[str]) -> float:
     """
     BM25Okapi: probabilistic relevance model.
@@ -253,13 +335,9 @@ def bm25_similarity(resume_tokens: List[str], jd_tokens: List[str]) -> float:
         return 0.0
 
     try:
-        # BM25 treats resume as the searchable corpus
         bm25 = BM25Okapi([resume_tokens], k1=1.5, b=0.75)
-
-        # Score: how well does the JD query match the resume?
         raw_score = bm25.get_scores(jd_tokens)[0]
 
-        # Normalize: score the doc against itself to get the theoretical max
         bm25_self = BM25Okapi([jd_tokens], k1=1.5, b=0.75)
         max_score = bm25_self.get_scores(jd_tokens)[0]
 
@@ -269,26 +347,32 @@ def bm25_similarity(resume_tokens: List[str], jd_tokens: List[str]) -> float:
         normalized = float(raw_score / max_score)
         return round(max(0.0, min(1.0, normalized)), 4)
     except Exception:
+        logger.exception("bm25_similarity failed, returning 0.0")
         return 0.0
 
 
-# ─── 6. SBERT SEMANTIC SIMILARITY ────────────────────────────────────────────
+# ─── 6. SBERT SEMANTIC SIMILARITY ─────────────────────────────────────────────
 def semantic_similarity(resume_text: str, jd_text: str) -> float:
     """
     Dense embedding cosine similarity via Sentence-BERT.
     Captures MEANING — 'built REST APIs' ≈ 'backend service development'.
     normalize_embeddings=True → dot product == cosine similarity (faster).
+    Runs inside torch.inference_mode() when torch is importable, so no
+    autograd graph / gradient buffers are retained for inference-only calls.
     """
     model = get_sbert()
+    texts = [resume_text[:2000], jd_text[:2000]]
 
-    embeddings = model.encode(
-     [resume_text[:2000], jd_text[:2000]],
-     normalize_embeddings=True
-    )
+    if _TORCH_AVAILABLE:
+        with torch.inference_mode():
+            embeddings = model.encode(texts, normalize_embeddings=True)
+    else:
+        embeddings = model.encode(texts, normalize_embeddings=True)
+
     return round(max(0.0, float(np.dot(embeddings[0], embeddings[1]))), 4)
 
 
-# ─── 7. SKILL OVERLAP (JACCARD) ──────────────────────────────────────────────
+# ─── 7. SKILL OVERLAP (JACCARD) ───────────────────────────────────────────────
 def skill_overlap_analysis(resume_skills: List[str], jd_skills: List[str]) -> Dict:
     """
     Jaccard = |A ∩ B| / |A ∪ B|
@@ -317,8 +401,8 @@ def skill_overlap_analysis(resume_skills: List[str], jd_skills: List[str]) -> Di
     }
 
 
-# ─── 8. ATS SCORE (NEW) ───────────────────────────────────────────────────────
-def compute_ats_score(resume_text: str, jd_text: str) -> Dict:
+# ─── 8. ATS SCORE ──────────────────────────────────────────────────────────────
+def compute_ats_score(jd_doc, resume_lower: str) -> Dict:
     """
     ATS (Applicant Tracking System) Simulation.
 
@@ -328,20 +412,16 @@ def compute_ats_score(resume_text: str, jd_text: str) -> Dict:
     because they used different phrasing.
 
     This function simulates that:
-      1. Extract significant keywords from JD (nouns, proper nouns, tech terms)
+      1. Extract significant keywords from the JD (nouns, proper nouns, noun chunks)
       2. Check each keyword for EXACT substring presence in the resume
       3. ATS score = % of JD keywords found verbatim in resume
 
-    We also identify "shadow keywords" — terms the JD emphasizes that the
-    candidate never uses (e.g., JD says "REST API", resume says "web services").
+    `jd_doc` is the already-parsed spaCy Doc for the JD text (reused, not
+    re-parsed here); `resume_lower` is the already-cleaned resume text,
+    lowercased.
     """
-    resume_lower = resume_text.lower()
-
-    # Extract JD keywords using spaCy POS filtering
-    doc = get_nlp()(jd_text[:4000])
     jd_keywords = []
-    for token in doc:
-        # Keep: nouns, proper nouns, adjectives that are likely technical
+    for token in jd_doc:
         if (
             token.pos_ in ("NOUN", "PROPN")
             and not token.is_stop
@@ -350,18 +430,15 @@ def compute_ats_score(resume_text: str, jd_text: str) -> Dict:
         ):
             jd_keywords.append(token.lemma_.lower())
 
-    # Also extract multi-word technical phrases (noun chunks)
-    noun_chunks = [chunk.text.lower() for chunk in doc.noun_chunks if len(chunk.text) > 3]
+    noun_chunks = [chunk.text.lower() for chunk in jd_doc.noun_chunks if len(chunk.text) > 3]
     jd_keywords.extend(noun_chunks)
     jd_keywords = list(set(jd_keywords))
 
-    # Check verbatim presence in resume
     found_keywords = [kw for kw in jd_keywords if kw in resume_lower]
     missing_keywords = [kw for kw in jd_keywords if kw not in resume_lower]
 
     ats_score = round(len(found_keywords) / len(jd_keywords) * 100, 1) if jd_keywords else 0.0
 
-    # ATS risk level
     if ats_score >= 70:
         risk = "Low"
         risk_note = "Good keyword coverage — likely to pass most ATS filters."
@@ -383,9 +460,11 @@ def compute_ats_score(resume_text: str, jd_text: str) -> Dict:
     }
 
 
-# ─── 9. NER EXTRACTION ───────────────────────────────────────────────────────
-def extract_named_entities(text: str) -> Dict:
-    doc = get_nlp()(text[:8000])
+# ─── 9. NER EXTRACTION ────────────────────────────────────────────────────────
+def extract_named_entities(doc, text: str) -> Dict:
+    """`doc` is the already-parsed spaCy Doc; `text` is the same
+    already-cleaned document text, used only for the years-of-experience
+    regex (which doesn't need spaCy)."""
     entities: Dict[str, List[str]] = {}
     for ent in doc.ents:
         entities.setdefault(ent.label_, [])
@@ -403,7 +482,7 @@ def extract_named_entities(text: str) -> Dict:
     }
 
 
-# ─── 10. COMPOSITE SCORING ENGINE (UPDATED) ───────────────────────────────────
+# ─── 10. COMPOSITE SCORING ENGINE ─────────────────────────────────────────────
 def composite_score(
     tfidf_sim: float,
     semantic_sim: float,
@@ -412,17 +491,16 @@ def composite_score(
     jaccard: float,
 ) -> Dict:
     """
-    Updated weighted ensemble — now 5 signals including BM25.
+    Weighted ensemble across 5 signals.
 
     Component           Weight  Rationale
     ──────────────────  ──────  ─────────────────────────────────────────────
     Semantic (SBERT)     0.30   Meaning-level match, most sophisticated signal
     Skill match rate     0.25   Direct requirement coverage, most job-relevant
-    BM25                 0.20   Better than TF-IDF for short docs (NEW)
+    BM25                 0.20   Better than TF-IDF for short docs
     TF-IDF cosine        0.15   Keyword/terminology alignment
     Jaccard overlap      0.10   Raw vocabulary overlap sanity check
 
-    BM25 replaces some TF-IDF weight because it handles term saturation better.
     Weights sum to 1.0 exactly.
     """
     weights = {
@@ -434,7 +512,7 @@ def composite_score(
     }
 
     raw = (
-        semantic_sim      * weights["semantic"]
+        semantic_sim        * weights["semantic"]
         + skill_match_rate  * weights["skill_match"]
         + bm25_sim          * weights["bm25"]
         + tfidf_sim         * weights["tfidf"]
@@ -454,117 +532,140 @@ def composite_score(
     }
 
 
-# ─── 11. MASTER ANALYSIS FUNCTION ────────────────────────────────────────────
+# ─── 11. MASTER ANALYSIS FUNCTION ─────────────────────────────────────────────
 def analyze_resume(resume_text: str, jd_text: str) -> Dict:
     """
-    Full pipeline entry point.
-
-    Steps:
-      1.  Section parsing
-      2.  Text preprocessing (lemmatize, clean)
-      3.  BM25 tokenization (light tokenize, preserves tech terms)
-      4.  Skill extraction (taxonomy + NER)
-      5.  TF-IDF cosine similarity
-      6.  BM25 similarity  ← NEW
-      7.  SBERT semantic similarity
-      8.  Skill overlap + Jaccard
-      9.  ATS score simulation  ← NEW
-      10. NER entity extraction
-      11. Composite weighted score (5 signals)
-      12. Assemble final report
+    Full pipeline entry point. Same signature and output shape as before —
+    only the internals changed (see PERFORMANCE NOTES at the top of this file).
     """
-    # 1. Sections
-    resume_sections = parse_sections(resume_text)
-    jd_sections     = parse_sections(jd_text)
-
-    # 2. Preprocess
-    resume_clean = preprocess_text(resume_text)
-    jd_clean     = preprocess_text(jd_text)
-
-    # 3. BM25 tokenization
-    resume_tokens = tokenize_for_bm25(resume_text)
-    jd_tokens     = tokenize_for_bm25(jd_text)
-
-    # 4. Skills
-    resume_skills_data = extract_skills(resume_text)
-    jd_skills_data     = extract_skills(jd_text)
-
-    # 5. TF-IDF
-    tfidf_sim   = tfidf_similarity(resume_clean, jd_clean)
-    tfidf_terms = get_tfidf_top_terms(resume_clean, jd_clean)
-
-    # 6. BM25
-    bm25_sim = bm25_similarity(resume_tokens, jd_tokens)
-
-    # 7. SBERT
-    sem_sim = semantic_similarity(resume_text, jd_text)
-
-    # 8. Skill overlap
-    skill_analysis = skill_overlap_analysis(
-        resume_skills_data["all"],
-        jd_skills_data["all"],
+    t_start = time.time()
+    logger.info(
+        "analyze_resume: start (resume=%d chars, jd=%d chars)",
+        len(resume_text), len(jd_text)
     )
 
-    # 9. ATS score
-    ats = compute_ats_score(resume_text, jd_text)
+    try:
+        # 0. Cap input length once, up front.
+        resume_text = truncate_text(resume_text, "resume")
+        jd_text = truncate_text(jd_text, "job_description")
 
-    # 10. NER
-    resume_ner = extract_named_entities(resume_text)
-    jd_ner     = extract_named_entities(jd_text)
+        # 1. Sections — cheap, run on the truncated (not yet URL/email-stripped)
+        #    text so section headers aren't disturbed by whitespace collapsing.
+        resume_sections = parse_sections(resume_text)
+        jd_sections = parse_sections(jd_text)
 
-    # 11. Composite score
-    scoring = composite_score(
-        tfidf_sim=tfidf_sim,
-        semantic_sim=sem_sim,
-        bm25_sim=bm25_sim,
-        skill_match_rate=skill_analysis["match_rate"],
-        jaccard=skill_analysis["jaccard_similarity"],
-    )
+        # Clean once; every downstream stage (spaCy, TF-IDF, BM25) shares this.
+        resume_clean = clean_text(resume_text)
+        jd_clean = clean_text(jd_text)
 
-    # 12. Assemble
-    return {
-        "score":            scoring["final_score"],
-        "scoring_breakdown": scoring,
-        "skill_analysis": {
-            "matched_skills":       skill_analysis["matched"],
-            "missing_skills":       skill_analysis["missing"],
-            "partial_match_skills": [p["required"] for p in skill_analysis["partial"]],
-            "partial_details":      skill_analysis["partial"],
-            "resume_skills":        resume_skills_data["all"],
-            "jd_skills":            jd_skills_data["all"],
-            "skills_by_category": {
-                "resume": {k: v for k, v in resume_skills_data.items() if k not in ("all", "ner_extracted") and v},
-                "jd":     {k: v for k, v in jd_skills_data.items()     if k not in ("all", "ner_extracted") and v},
+        # 2. ONE spaCy parse per document, reused everywhere below.
+        nlp_model = get_nlp()
+        t0 = time.time()
+        resume_doc = nlp_model(resume_clean)
+        jd_doc = nlp_model(jd_clean)
+        logger.info("stage: spaCy parse done in %.2fs", time.time() - t0)
+
+        # 3. Lemmatized text for TF-IDF, + BM25 tokens
+        resume_lemmas = preprocess_text(resume_doc)
+        jd_lemmas = preprocess_text(jd_doc)
+        resume_tokens = tokenize_for_bm25(resume_clean)
+        jd_tokens = tokenize_for_bm25(jd_clean)
+        logger.info("stage: preprocessing/tokenization done")
+
+        # 4. Skills
+        resume_lower = resume_clean.lower()
+        jd_lower = jd_clean.lower()
+        t0 = time.time()
+        resume_skills_data = extract_skills(resume_lower, resume_doc)
+        jd_skills_data = extract_skills(jd_lower, jd_doc)
+        logger.info("stage: skill extraction done in %.2fs", time.time() - t0)
+
+        # 5. TF-IDF
+        tfidf_sim = tfidf_similarity(resume_lemmas, jd_lemmas)
+        tfidf_terms = get_tfidf_top_terms(resume_lemmas, jd_lemmas)
+
+        # 6. BM25
+        bm25_sim = bm25_similarity(resume_tokens, jd_tokens)
+
+        # 7. SBERT
+        t0 = time.time()
+        sem_sim = semantic_similarity(resume_clean, jd_clean)
+        logger.info("stage: SBERT similarity done in %.2fs", time.time() - t0)
+
+        # 8. Skill overlap
+        skill_analysis = skill_overlap_analysis(
+            resume_skills_data["all"],
+            jd_skills_data["all"],
+        )
+
+        # 9. ATS score (reuses jd_doc — no re-parse)
+        ats = compute_ats_score(jd_doc, resume_lower)
+
+        # 10. NER (reuses resume_doc / jd_doc — no re-parse)
+        resume_ner = extract_named_entities(resume_doc, resume_clean)
+        jd_ner = extract_named_entities(jd_doc, jd_clean)
+
+        # 11. Composite score
+        scoring = composite_score(
+            tfidf_sim=tfidf_sim,
+            semantic_sim=sem_sim,
+            bm25_sim=bm25_sim,
+            skill_match_rate=skill_analysis["match_rate"],
+            jaccard=skill_analysis["jaccard_similarity"],
+        )
+
+        # 12. Assemble
+        result = {
+            "score":            scoring["final_score"],
+            "scoring_breakdown": scoring,
+            "skill_analysis": {
+                "matched_skills":       skill_analysis["matched"],
+                "missing_skills":       skill_analysis["missing"],
+                "partial_match_skills": [p["required"] for p in skill_analysis["partial"]],
+                "partial_details":      skill_analysis["partial"],
+                "resume_skills":        resume_skills_data["all"],
+                "jd_skills":            jd_skills_data["all"],
+                "skills_by_category": {
+                    "resume": {k: v for k, v in resume_skills_data.items() if k not in ("all", "ner_extracted") and v},
+                    "jd":     {k: v for k, v in jd_skills_data.items()     if k not in ("all", "ner_extracted") and v},
+                },
             },
-        },
-        "similarity_scores": {
-            "tfidf_cosine":     round(tfidf_sim * 100, 1),
-            "bm25":             round(bm25_sim * 100, 1),
-            "semantic_sbert":   round(sem_sim * 100, 1),
-            "skill_jaccard":    round(skill_analysis["jaccard_similarity"] * 100, 1),
-            "skill_match_rate": round(skill_analysis["match_rate"] * 100, 1),
-        },
-        "ats_analysis":  ats,
-        "tfidf_analysis": tfidf_terms,
-        "named_entities": {
-            "resume": resume_ner,
-            "jd":     jd_ner,
-        },
-        "sections_found": {
-            "resume": list(resume_sections.keys()),
-            "jd":     list(jd_sections.keys()),
-        },
-        "text_stats": {
-            "resume_word_count": len(resume_text.split()),
-            "jd_word_count":     len(jd_text.split()),
-            "resume_vocab_size": len(set(resume_clean.split())),
-            "jd_vocab_size":     len(set(jd_clean.split())),
-        },
-    }
+            "similarity_scores": {
+                "tfidf_cosine":     round(tfidf_sim * 100, 1),
+                "bm25":             round(bm25_sim * 100, 1),
+                "semantic_sbert":   round(sem_sim * 100, 1),
+                "skill_jaccard":    round(skill_analysis["jaccard_similarity"] * 100, 1),
+                "skill_match_rate": round(skill_analysis["match_rate"] * 100, 1),
+            },
+            "ats_analysis":  ats,
+            "tfidf_analysis": tfidf_terms,
+            "named_entities": {
+                "resume": resume_ner,
+                "jd":     jd_ner,
+            },
+            "sections_found": {
+                "resume": list(resume_sections.keys()),
+                "jd":     list(jd_sections.keys()),
+            },
+            "text_stats": {
+                "resume_word_count": len(resume_text.split()),
+                "jd_word_count":     len(jd_text.split()),
+                "resume_vocab_size": len(set(resume_lemmas.split())),
+                "jd_vocab_size":     len(set(jd_lemmas.split())),
+            },
+        }
+
+        logger.info("analyze_resume: done in %.2fs", time.time() - t_start)
+        return result
+
+    except Exception:
+        logger.exception("analyze_resume: failed after %.2fs", time.time() - t_start)
+        raise
 
 
 if __name__ == "__main__":
     import json
+    logging.basicConfig(level=logging.INFO)
     r = analyze_resume(
         "Python developer, 5 years. React, FastAPI, PostgreSQL, Docker, Kubernetes, AWS.",
         "Need senior engineer: Python, TypeScript, React, GraphQL, PostgreSQL, Kubernetes, Redis."
