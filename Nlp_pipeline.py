@@ -38,12 +38,37 @@ from rapidfuzz import fuzz, process
 # BM25 — NEW
 from rank_bm25 import BM25Okapi
 
-# ─── Load models once at module level ────────────────────────────────────────
-print("Loading spaCy model...")
-nlp = spacy.load("en_core_web_md")
+# ─── Lazy model loading ──────────────────────────────────────────────────────
+# Models are NOT loaded when FastAPI imports this module.
+# This keeps /health lightweight and prevents Render startup OOM.
 
-print("Loading SBERT model...")
-sbert = SentenceTransformer("all-MiniLM-L6-v2")
+nlp = None
+sbert = None
+
+
+def get_nlp():
+    global nlp
+
+    if nlp is None:
+        print("Loading spaCy model...")
+        nlp = spacy.load("en_core_web_sm")
+        print("spaCy model loaded.")
+
+    return nlp
+
+
+def get_sbert():
+    global sbert
+
+    if sbert is None:
+        print("Loading SBERT model...")
+        sbert = SentenceTransformer(
+            "all-MiniLM-L6-v2",
+            device="cpu"
+        )
+        print("SBERT model loaded.")
+
+    return sbert
 
 
 # ─── Skill taxonomy ───────────────────────────────────────────────────────────
@@ -103,7 +128,7 @@ def preprocess_text(text: str) -> str:
     text = re.sub(r"\S+@\S+", " ", text)
     text = re.sub(r"\+?\d[\d\s\-\(\)]{8,}\d", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    doc = nlp(text)
+    doc = get_nlp()(text)
     tokens = [
         token.lemma_.lower() for token in doc
         if not token.is_stop and not token.is_punct
@@ -164,7 +189,7 @@ def extract_skills(text: str, threshold: int = 85) -> Dict[str, List[str]]:
                 if match and match[1] >= threshold:
                     found[category].append(skill)
 
-    doc = nlp(text[:5000])
+    doc = get_nlp()(text[:5000])
     ner_skills = [ent.text.lower() for ent in doc.ents if ent.label_ in ("PRODUCT", "ORG", "WORK_OF_ART")]
     found["ner_extracted"] = list(set(ner_skills))
     found["all"] = sorted(set(s for cat, skills in found.items() if cat != "all" for s in skills))
@@ -254,9 +279,11 @@ def semantic_similarity(resume_text: str, jd_text: str) -> float:
     Captures MEANING — 'built REST APIs' ≈ 'backend service development'.
     normalize_embeddings=True → dot product == cosine similarity (faster).
     """
-    embeddings = sbert.encode(
-        [resume_text[:2000], jd_text[:2000]],
-        normalize_embeddings=True
+    model = get_sbert()
+
+    embeddings = model.encode(
+     [resume_text[:2000], jd_text[:2000]],
+     normalize_embeddings=True
     )
     return round(max(0.0, float(np.dot(embeddings[0], embeddings[1]))), 4)
 
@@ -311,7 +338,7 @@ def compute_ats_score(resume_text: str, jd_text: str) -> Dict:
     resume_lower = resume_text.lower()
 
     # Extract JD keywords using spaCy POS filtering
-    doc = nlp(jd_text[:4000])
+    doc = get_nlp()(jd_text[:4000])
     jd_keywords = []
     for token in doc:
         # Keep: nouns, proper nouns, adjectives that are likely technical
@@ -358,7 +385,7 @@ def compute_ats_score(resume_text: str, jd_text: str) -> Dict:
 
 # ─── 9. NER EXTRACTION ───────────────────────────────────────────────────────
 def extract_named_entities(text: str) -> Dict:
-    doc = nlp(text[:8000])
+    doc = get_nlp()(text[:8000])
     entities: Dict[str, List[str]] = {}
     for ent in doc.ents:
         entities.setdefault(ent.label_, [])
