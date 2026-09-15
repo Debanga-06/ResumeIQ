@@ -13,6 +13,7 @@ Docs:   http://localhost:8000/docs
 
 import os
 import time
+import logging
 import traceback
 import json
 import asyncio
@@ -28,6 +29,15 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from Nlp_pipeline import analyze_resume
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Configured here (the app entrypoint) so Nlp_pipeline's logger.info/.exception
+# calls also show up in Render's logs, with stage timings and tracebacks.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("resumeiq.api")
 
 # ── Suppress noisy warnings ────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", message=".*position_ids.*")
@@ -56,7 +66,7 @@ _gemini_client: genai.Client | None = None
 if _GEMINI_API_KEY:
     _gemini_client = genai.Client(api_key=_GEMINI_API_KEY)
 else:
-    print("WARNING: GEMINI_API_KEY not set — /improve endpoint will return 500.")
+    logger.warning("GEMINI_API_KEY not set — /improve endpoint will return 500.")
 
 
 # ── Request / Response models ──────────────────────────────────────────────────
@@ -92,28 +102,44 @@ async def analyze(req: ScreenRequest):
 
     Signals:
       SBERT semantic similarity  (30%)
-      Skill match rate           (28%)
+      Skill match rate           (25%)
       BM25 probabilistic         (20%)
-      TF-IDF cosine              (12%)
+      TF-IDF cosine              (15%)
       Jaccard overlap            (10%)
 
     Also returns: ATS score simulation, spaCy NER extraction, TF-IDF term analysis.
+
+    BUG FIX (root cause of production 502s): this route is `async def`, but
+    `analyze_resume()` is a fully synchronous, CPU-bound function (spaCy +
+    SBERT + fuzzy matching). Calling it directly blocked the single asyncio
+    event loop for the entire duration of the request — on Render's shared
+    CPU that could run long enough to trip the platform's upstream timeout,
+    which surfaces to the browser as a 502 rather than a normal FastAPI
+    error response. Running it via asyncio.to_thread() keeps the event loop
+    free to serve /health and other requests while the analysis runs.
     """
     if len(req.resume.strip()) < 30:
         raise HTTPException(400, "Resume too short")
     if len(req.job_description.strip()) < 30:
         raise HTTPException(400, "Job description too short")
 
-    # BUG FIX: renamed from 'start' to 'req_start' — 'start' was reused inside
-    # /improve causing a variable collision that silently overwrote the timer.
     req_start = time.time()
+    logger.info(
+        "/analyze: request received (resume=%d chars, jd=%d chars, candidate=%s)",
+        len(req.resume), len(req.job_description), req.candidate_name or "-",
+    )
     try:
-        result = analyze_resume(req.resume, req.job_description)
+        result = await asyncio.to_thread(analyze_resume, req.resume, req.job_description)
         result["processing_time_ms"] = round((time.time() - req_start) * 1000, 1)
         if req.candidate_name:
             result["candidate_name"] = req.candidate_name
+        logger.info(
+            "/analyze: request completed in %.1fms (score=%s)",
+            result["processing_time_ms"], result.get("score"),
+        )
         return result
     except Exception as e:
+        logger.exception("/analyze: analysis failed after %.1fms", (time.time() - req_start) * 1000)
         traceback.print_exc()
         raise HTTPException(500, f"Analysis failed: {str(e)}")
 
@@ -124,20 +150,26 @@ async def batch_analyze(resumes: List[ScreenRequest]):
     """
     Screen multiple resumes. Returns all results sorted by score descending.
     Max 30 resumes per request.
+
+    Each resume is analyzed via asyncio.to_thread() for the same reason as
+    /analyze — analyze_resume() is CPU-bound and must not block the event
+    loop, especially across up to 30 sequential calls in one request.
     """
     if len(resumes) > 30:
         raise HTTPException(400, "Batch limit is 30 resumes per request")
 
+    logger.info("/batch: request received (%d resumes)", len(resumes))
     results = []
     for i, req in enumerate(resumes):
         req_start = time.time()
         try:
-            r = analyze_resume(req.resume, req.job_description)
+            r = await asyncio.to_thread(analyze_resume, req.resume, req.job_description)
             r["index"]              = i
             r["candidate_name"]     = req.candidate_name or f"Candidate {i + 1}"
             r["processing_time_ms"] = round((time.time() - req_start) * 1000, 1)
             results.append(r)
         except Exception as e:
+            logger.exception("/batch: candidate %d failed", i)
             results.append({
                 "index":          i,
                 "candidate_name": req.candidate_name or f"Candidate {i + 1}",
@@ -145,6 +177,7 @@ async def batch_analyze(resumes: List[ScreenRequest]):
                 "score":          0,
             })
 
+    logger.info("/batch: request completed (%d results)", len(results))
     return sorted(results, key=lambda x: x.get("score", 0), reverse=True)
 
 
@@ -157,16 +190,18 @@ async def improve(req: ImproveRequest):
     Requires GEMINI_API_KEY in environment / .env file.
     Accepts the full /analyze result so the ML pipeline is NOT re-run.
     """
-    # BUG FIX: check the module-level client, not a local re-initialisation
     if _gemini_client is None:
         raise HTTPException(500, "GEMINI_API_KEY not set — add it to your .env file")
 
-    # Extract what we need from the analysis dict
     analysis       = req.analysis
     score          = analysis.get("score", 0)
     missing_skills = analysis.get("skill_analysis", {}).get("missing_skills", [])
     partial_skills = analysis.get("skill_analysis", {}).get("partial_match_skills", [])
-    ats_missing    = analysis.get("ats_analysis", {}).get("keywords_missing", [])
+    # BUG FIX: ats_analysis's actual field is "missing_keywords" (see
+    # Nlp_pipeline.py's compute_ats_score()), not "keywords_missing" — the
+    # old key name here meant ats_missing was silently always [] and never
+    # reached the Gemini prompt below.
+    ats_missing    = analysis.get("ats_analysis", {}).get("missing_keywords", [])
     ats_score      = analysis.get("ats_analysis", {}).get("ats_score", 0)
     tfidf_jd_terms = analysis.get("tfidf_analysis", {}).get("jd_top_terms", [])
 
@@ -208,24 +243,17 @@ Return ONLY a JSON array — no markdown fences, no explanation, nothing else:
     try:
         # asyncio.to_thread() runs the blocking Gemini SDK call in a thread pool
         # so FastAPI's async event loop is not blocked.
-        # BUG FIX: previously generate_content was called TWICE — once correctly,
-        # once again immediately after with a different (wrong) model name
-        # "gemini-flash-latest". The second call overwrote the first response,
-        # causing failures when the model name didn't resolve.
         response = await asyncio.to_thread(
             _gemini_client.models.generate_content,
-            model="gemini-2.5-flash",          # one call, one correct model name
+            model="gemini-2.5-flash",
             contents=prompt,
         )
 
-        # Safely extract text — Gemini SDK response structure can vary
         if hasattr(response, "text") and response.text:
             raw = response.text.strip()
         else:
             raw = response.candidates[0].content.parts[0].text.strip()
 
-        # BUG FIX: 'start' was already used as a variable name in /analyze.
-        # Renamed to 'json_start' / 'json_end' to be unambiguous.
         json_start = raw.find("[")
         json_end   = raw.rfind("]") + 1
 
@@ -240,11 +268,9 @@ Return ONLY a JSON array — no markdown fences, no explanation, nothing else:
         }
 
     except json.JSONDecodeError as e:
-        # BUG FIX: previously the except block silently returned an error dict.
-        # This meant the frontend received a 200 with {error: ...} instead of
-        # a proper HTTP error — hard to debug. Now raises HTTPException correctly.
         raise HTTPException(500, f"Gemini returned invalid JSON: {str(e)}")
     except Exception as e:
+        logger.exception("/improve: generation failed")
         traceback.print_exc()
         raise HTTPException(500, f"Improvement generation failed: {str(e)}")
 
