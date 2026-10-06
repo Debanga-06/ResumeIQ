@@ -12,9 +12,4 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.11"
-
-      - key: TOKENIZERS_PARALLELISM
-        value: "false"
-
-      - key: SENTENCE_TRANSFORMERS_HOME
-        value: /tmp/sbert_cache
+   
