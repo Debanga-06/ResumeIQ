@@ -3,8 +3,9 @@ Nlp_pipeline.py — Real ML/NLP Resume Screening Pipeline
 
 Models & algorithms used:
   - spaCy (en_core_web_sm)         → NER, POS tagging, lemmatization, noun chunks
-  - scikit-learn TfidfVectorizer   → TF-IDF document vectors
-  - sentence-transformers (SBERT)  → Dense semantic embeddings
+  - scikit-learn TfidfVectorizer   → TF-IDF document vectors (used for BOTH
+                                      keyword-level similarity AND the
+                                      "semantic_sbert" signal — see note below)
   - rank_bm25 (BM25Okapi)          → Probabilistic term weighting
   - rapidfuzz                      → Fuzzy skill matching
   - sklearn cosine_similarity      → Vector distance
@@ -20,8 +21,8 @@ WHY BM25 over pure TF-IDF?
 
 WHY ATS score separately?
   Applicant Tracking Systems used by 99% of Fortune 500 companies do EXACT keyword
-  matching — no semantics, no fuzzy. A candidate with 90% SBERT semantic similarity
-  can fail ATS if they write "built APIs" instead of "REST API development".
+  matching — no semantics, no fuzzy. A candidate with a high overall match score
+  can still fail ATS if they write "built APIs" instead of "REST API development".
   The ATS score tells candidates: "fix THIS specific wording to pass the filter."
 
 PERFORMANCE NOTES (read this if /analyze is slow or 502s on Render)
@@ -46,10 +47,29 @@ PERFORMANCE NOTES (read this if /analyze is slow or 502s on Render)
     3. extract_skills() builds its fuzzy-match candidate list (words +
        bigrams) ONCE per document instead of once per taxonomy skill —
        this was the single biggest CPU cost on longer resumes.
-    4. SBERT inference runs inside torch.inference_mode() to avoid
-       retaining any autograd state.
-    5. Stage-by-stage logging so Render logs show exactly where time is
-       spent (or where a failure happens) instead of a bare 502/500.
+    4. Stage-by-stage logging so Render logs show exactly where time is
+       spent (or where a failure happens) instead of a bare 502/503.
+
+PRODUCTION INCIDENT — OOM while loading SBERT ("used over 512MB")
+  Render's Starter web service plan is a hard 512 MB RAM ceiling. By the
+  time a request reached the old get_sbert(), the process already had
+  Python + uvicorn + spaCy (en_core_web_sm) resident, plus the
+  sentence-transformers/torch *import* machinery loaded at module import
+  time. Actually instantiating the SentenceTransformer("all-MiniLM-L6-v2")
+  model pushed resident memory over 512 MB, and Render's OOM killer killed
+  the instance mid-request — which surfaced to the browser as a 503, and
+  because the dead backend sent no CORS headers on that response, as a
+  browser-side "CORS error" (it wasn't a CORS misconfiguration; a backend
+  that's alive and responding would have sent the configured
+  Access-Control-Allow-Origin header same as /health does).
+
+  FIX: SBERT / PyTorch have been removed entirely — no `sentence_transformers`
+  import, no `torch` import, no model download, no model held in memory.
+  `semantic_similarity()` is now a lightweight TF-IDF cosine similarity
+  (scikit-learn, already a dependency, no new model weights to load). The
+  output field name `semantic_sbert` is kept as-is in the response schema
+  so the frontend needs no changes — see that function's docstring for the
+  concrete accuracy trade-off this implies.
 """
 
 import re
@@ -60,15 +80,8 @@ import numpy as np
 from typing import Dict, List
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 from rapidfuzz import fuzz, process
 from rank_bm25 import BM25Okapi
-
-try:
-    import torch
-    _TORCH_AVAILABLE = True
-except ImportError:  # pragma: no cover - torch ships transitively via sentence-transformers
-    _TORCH_AVAILABLE = False
 
 logger = logging.getLogger("resumeiq.pipeline")
 
@@ -80,11 +93,12 @@ logger = logging.getLogger("resumeiq.pipeline")
 MAX_INPUT_CHARS = 6000
 
 # ─── Lazy model loading ────────────────────────────────────────────────────────
-# Models are NOT loaded when FastAPI imports this module.
-# This keeps /health lightweight and prevents Render startup OOM.
+# spaCy is the only model left to load. It is NOT loaded when FastAPI imports
+# this module — this keeps /health lightweight and the first /analyze request
+# predictable. No SentenceTransformer/torch model exists anywhere in this
+# file anymore (see PRODUCTION INCIDENT note above).
 
 nlp = None
-sbert = None
 
 
 def get_nlp():
@@ -95,19 +109,6 @@ def get_nlp():
         nlp = spacy.load("en_core_web_sm")
         logger.info("spaCy model loaded in %.2fs", time.time() - t0)
     return nlp
-
-
-def get_sbert():
-    global sbert
-    if sbert is None:
-        logger.info("Loading SBERT model (all-MiniLM-L6-v2)...")
-        t0 = time.time()
-        sbert = SentenceTransformer(
-            "all-MiniLM-L6-v2",
-            device="cpu"
-        )
-        logger.info("SBERT model loaded in %.2fs", time.time() - t0)
-    return sbert
 
 
 # ─── Skill taxonomy ───────────────────────────────────────────────────────────
@@ -351,25 +352,52 @@ def bm25_similarity(resume_tokens: List[str], jd_tokens: List[str]) -> float:
         return 0.0
 
 
-# ─── 6. SBERT SEMANTIC SIMILARITY ─────────────────────────────────────────────
+# ─── 6. SEMANTIC SIMILARITY (TF-IDF APPROXIMATION — see note) ────────────────
 def semantic_similarity(resume_text: str, jd_text: str) -> float:
     """
-    Dense embedding cosine similarity via Sentence-BERT.
-    Captures MEANING — 'built REST APIs' ≈ 'backend service development'.
-    normalize_embeddings=True → dot product == cosine similarity (faster).
-    Runs inside torch.inference_mode() when torch is importable, so no
-    autograd graph / gradient buffers are retained for inference-only calls.
+    Lightweight semantic similarity approximation using TF-IDF cosine
+    similarity. This replaces the memory-heavy SBERT/PyTorch implementation
+    so /analyze can run reliably inside Render's 512 MB instance limit (see
+    the PRODUCTION INCIDENT note at the top of this file).
+
+    Output field name stays "semantic_sbert" in the API response for
+    frontend compatibility — the implementation underneath is now TF-IDF,
+    not a transformer embedding.
+
+    Honest trade-off: SBERT caught paraphrase-level matches ("built REST
+    APIs" ≈ "backend service development") that share no exact wording.
+    TF-IDF cosine similarity cannot do that — it scores vocabulary overlap
+    (with bigrams), not meaning. In practice this signal now behaves
+    similarly to tfidf_similarity() below but is computed independently
+    with its own vectorizer/max_features, so it isn't simply a duplicate
+    number — it's still one less genuinely distinct signal than before.
+    That's the real cost of dropping SBERT; it is not hidden by keeping the
+    old field name.
     """
-    model = get_sbert()
-    texts = [resume_text[:2000], jd_text[:2000]]
+    try:
+        texts = [
+            resume_text[:2000],
+            jd_text[:2000],
+        ]
 
-    if _TORCH_AVAILABLE:
-        with torch.inference_mode():
-            embeddings = model.encode(texts, normalize_embeddings=True)
-    else:
-        embeddings = model.encode(texts, normalize_embeddings=True)
+        vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),
+            max_features=3000,
+            sublinear_tf=True,
+        )
 
-    return round(max(0.0, float(np.dot(embeddings[0], embeddings[1]))), 4)
+        matrix = vectorizer.fit_transform(texts)
+
+        score = cosine_similarity(
+            matrix[0:1],
+            matrix[1:2],
+        )[0][0]
+
+        return round(max(0.0, min(1.0, float(score))), 4)
+
+    except Exception:
+        logger.exception("semantic_similarity failed, returning 0.0")
+        return 0.0
 
 
 # ─── 7. SKILL OVERLAP (JACCARD) ───────────────────────────────────────────────
@@ -408,8 +436,8 @@ def compute_ats_score(jd_doc, resume_lower: str) -> Dict:
 
     Most ATS systems (Taleo, Workday, Greenhouse) do EXACT or near-exact
     keyword matching. They DO NOT use embeddings or semantic understanding.
-    A candidate scoring 90% on SBERT can still fail ATS with 30% keyword match
-    because they used different phrasing.
+    A candidate scoring high on the semantic signal above can still fail ATS
+    with a low keyword match because they used different phrasing.
 
     This function simulates that:
       1. Extract significant keywords from the JD (nouns, proper nouns, noun chunks)
@@ -493,15 +521,18 @@ def composite_score(
     """
     Weighted ensemble across 5 signals.
 
-    Component           Weight  Rationale
-    ──────────────────  ──────  ─────────────────────────────────────────────
-    Semantic (SBERT)     0.30   Meaning-level match, most sophisticated signal
-    Skill match rate     0.25   Direct requirement coverage, most job-relevant
-    BM25                 0.20   Better than TF-IDF for short docs
-    TF-IDF cosine        0.15   Keyword/terminology alignment
-    Jaccard overlap      0.10   Raw vocabulary overlap sanity check
+    Component              Weight  Rationale
+    ─────────────────────  ──────  ──────────────────────────────────────────
+    Semantic (TF-IDF)       0.30   Broader-window (2000 char) vocabulary match;
+                                    field name kept as "semantic_sbert" for the
+                                    frontend — see semantic_similarity()'s
+                                    docstring for what changed under the hood
+    Skill match rate        0.25   Direct requirement coverage, most job-relevant
+    BM25                    0.20   Better than TF-IDF for short docs
+    TF-IDF cosine           0.15   Keyword/terminology alignment (own vectorizer)
+    Jaccard overlap         0.10   Raw vocabulary overlap sanity check
 
-    Weights sum to 1.0 exactly.
+    Weights are UNCHANGED from the SBERT-based version and sum to 1.0 exactly.
     """
     weights = {
         "semantic":    0.30,
@@ -587,10 +618,10 @@ def analyze_resume(resume_text: str, jd_text: str) -> Dict:
         # 6. BM25
         bm25_sim = bm25_similarity(resume_tokens, jd_tokens)
 
-        # 7. SBERT
+        # 7. Semantic similarity (TF-IDF approximation — no SBERT/torch)
         t0 = time.time()
         sem_sim = semantic_similarity(resume_clean, jd_clean)
-        logger.info("stage: SBERT similarity done in %.2fs", time.time() - t0)
+        logger.info("stage: semantic similarity done in %.2fs", time.time() - t0)
 
         # 8. Skill overlap
         skill_analysis = skill_overlap_analysis(
