@@ -6,8 +6,10 @@ httpx==0.28.1
 python-multipart==0.0.20
 
 # NLP / Resume analysis
+# sentence-transformers / torch removed — SBERT was the cause of the 512MB
+# OOM kill during /analyze. semantic_similarity() now runs on scikit-learn
+# TF-IDF instead (see Nlp_pipeline.py's PRODUCTION INCIDENT note).
 spacy==3.7.5
-sentence-transformers==3.3.1
 scikit-learn==1.6.1
 numpy==1.26.4
 rapidfuzz==3.11.0
